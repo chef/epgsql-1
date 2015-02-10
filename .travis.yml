@@ -1,0 +1,14 @@
+language: erlang
+otp_release:
+  - R16B03-1
+before_script:
+  - sudo apt-get update -qq
+  - sudo apt-get install -y cpanminus perl libdbd-pg-perl build-essential
+addons:
+  postgresql: "9.3"
+script:
+  - ./setup_test_db.sh
+  - nohup ./start_test_db.sh &
+  - make create_testdbs
+  - make test
+
