@@ -26,6 +26,7 @@
               squery_row/0, equery_row/0, reply/1]).
 
 -include("epgsql.hrl").
+-define(EXEC_MAX_WAIT, 1000).
 
 -type sql_query() :: string() | iodata().
 -type host() :: inet:ip_address() | inet:hostname().
@@ -92,9 +93,8 @@ connect(Host, Username, Password, Opts) ->
         -> {ok, Connection :: connection()} | {error, Reason :: connect_error()}.
 connect(C, Host, Username, Password, Opts) ->
     %% TODO connect timeout
-    case gen_server:call(C,
-                         {connect, Host, Username, Password, Opts},
-                         infinity) of
+    case send_or_terminate(C,
+                         {connect, Host, Username, Password, Opts}) of
         connected ->
             update_type_cache(C),
             {ok, C};
@@ -109,7 +109,7 @@ update_type_cache(C) ->
             " FROM pg_type"
             " WHERE typname = ANY($1::varchar[])",
     {ok, _, TypeInfos} = equery(C, Query, [DynamicTypes]),
-    ok = gen_server:call(C, {update_type_cache, TypeInfos}).
+    ok = send_or_terminate(C, {update_type_cache, TypeInfos}).
 
 -spec close(connection()) -> ok.
 close(C) ->
@@ -122,7 +122,7 @@ get_parameter(C, Name) ->
 -spec squery(connection(), sql_query()) -> reply(squery_row()) | [reply(squery_row())].
 %% @doc runs simple `SqlQuery' via given `Connection'
 squery(Connection, SqlQuery) ->
-    gen_server:call(Connection, {squery, SqlQuery}, infinity).
+    send_or_terminate(Connection, {squery, SqlQuery}).
 
 equery(C, Sql) ->
     equery(C, Sql, []).
@@ -132,7 +132,7 @@ equery(C, Sql, Parameters) ->
     case parse(C, "", Sql, []) of
         {ok, #statement{types = Types} = S} ->
             Typed_Parameters = lists:zip(Types, Parameters),
-            gen_server:call(C, {equery, S, Typed_Parameters}, infinity);
+            send_or_terminate(C, {equery, S, Typed_Parameters});
         Error ->
             Error
     end.
@@ -142,7 +142,7 @@ equery(C, Name, Sql, Parameters) ->
     case parse(C, Name, Sql, []) of
         {ok, #statement{types = Types} = S} ->
             Typed_Parameters = lists:zip(Types, Parameters),
-            gen_server:call(C, {equery, S, Typed_Parameters}, infinity);
+            send_or_terminate(C, {equery, S, Typed_Parameters});
         Error ->
             Error
     end.
@@ -158,7 +158,7 @@ parse(C, Sql, Types) ->
 -spec parse(connection(), iolist(), sql_query(), [epgsql_type()]) ->
                    {ok, #statement{}} | {error, query_error()}.
 parse(C, Name, Sql, Types) ->
-    sync_on_error(C, gen_server:call(C, {parse, Name, Sql, Types}, infinity)).
+    sync_on_error(C, send_or_terminate(C, {parse, Name, Sql, Types})).
 
 %% bind
 
@@ -170,7 +170,7 @@ bind(C, Statement, Parameters) ->
 bind(C, Statement, PortalName, Parameters) ->
     sync_on_error(
       C,
-      gen_server:call(C, {bind, Statement, PortalName, Parameters}, infinity)).
+      send_or_terminate(C, {bind, Statement, PortalName, Parameters})).
 
 %% execute
 
@@ -187,12 +187,12 @@ execute(C, S, N) ->
              | {ok, non_neg_integer(), [equery_row()]}
              | {error, query_error()}.
 execute(C, S, PortalName, N) ->
-    gen_server:call(C, {execute, S, PortalName, N}, infinity).
+    send_or_terminate(C, {execute, S, PortalName, N}).
 -spec execute_batch(connection(), [{#statement{}, [bind_param()]}]) -> [reply(equery_row())] |
                                                                        [{ok, [equery_row()]}] |
                                                                        [{ok, Count :: non_neg_integer(), RowsValues::[equery_row()]}].
 execute_batch(C, Batch) ->
-    gen_server:call(C, {execute_batch, Batch}, infinity).
+    send_or_terminate(C, {execute_batch, Batch}).
 
 %% statement/portal functions
 
@@ -200,20 +200,20 @@ describe(C, #statement{name = Name}) ->
     describe(C, statement, Name).
 
 describe(C, statement, Name) ->
-    sync_on_error(C, gen_server:call(C, {describe_statement, Name}, infinity));
+    sync_on_error(C, send_or_terminate(C, {describe_statement, Name}));
 
 %% TODO unknown result format of Describe portal
 describe(C, portal, Name) ->
-    sync_on_error(C, gen_server:call(C, {describe_portal, Name}, infinity)).
+    sync_on_error(C, send_or_terminate(C, {describe_portal, Name})).
 
 close(C, #statement{name = Name}) ->
     close(C, statement, Name).
 
 close(C, Type, Name) ->
-    gen_server:call(C, {close, Type, Name}).
+    send_or_terminate(C, {close, Type, Name}).
 
 sync(C) ->
-    gen_server:call(C, sync).
+    send_or_terminate(C, sync).
 
 -spec cancel(connection()) -> ok.
 cancel(C) ->
@@ -243,3 +243,12 @@ sync_on_error(C, Error = {error, _}) ->
 sync_on_error(_C, R) ->
     R.
 
+send_or_terminate(Connection, Request) ->
+    gen_server:call(Connection, Request, infinity).
+    %case gen_server:call(Connection, Request, ?EXEC_MAX_WAIT) of
+        %{error, timeout} ->
+            %erlang:exit(Connection, timeout),
+            %{error, timeout};
+        %Other ->
+            %Other
+    %end.
