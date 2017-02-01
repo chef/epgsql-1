@@ -244,7 +244,7 @@ sync_on_error(_C, R) ->
     R.
 
 send_or_terminate(Connection, Request) ->
-    gen_server:call(Connection, Request, ?EXEC_MAX_WAIT).
+    gen_server:call(Connection, Request, infinity).
     %case gen_server:call(Connection, Request, ?EXEC_MAX_WAIT) of
         %{error, timeout} ->
             %erlang:exit(Connection, timeout),

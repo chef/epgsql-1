@@ -72,7 +72,8 @@
                 results = [],
                 batch = [],
                 sync_required,
-                txstatus}).
+                txstatus,
+                timeout}).
 
 %% -- client interface --
 
@@ -97,7 +98,6 @@ init([]) ->
 handle_call({update_type_cache, TypeInfos}, _From, #state{codec = Codec} = State) ->
     Codec2 = epgsql_binary:update_type_cache(TypeInfos, Codec),
     {reply, ok, State#state{codec = Codec2}};
-
 handle_call({get_parameter, Name}, _From, State) ->
     Value1 = case lists:keysearch(Name, 1, State#state.parameters) of
         {value, {Name, Value}} -> Value;
@@ -126,7 +126,8 @@ handle_cast(cancel, State = #state{backend = {Pid, Key},
                              gen_tcp -> inet:peername(TimedOutSock);
                              ssl -> ssl:peername(TimedOutSock)
                          end,
-    SockOpts = [{active, false}, {packet, raw}, binary],
+    SockOpts = [{active, false}, {packet, raw}, binary,
+                {keepalive, true}],
     %% TODO timeout
     {ok, Sock} = gen_tcp:connect(Addr, Port, SockOpts),
     Msg = <<16:?int32, 80877102:?int32, Pid:?int32, Key:?int32>>,
@@ -137,19 +138,28 @@ handle_cast(cancel, State = #state{backend = {Pid, Key},
 handle_info({Closed, Sock}, #state{sock = Sock} = State)
   when Closed == tcp_closed; Closed == ssl_closed ->
     {stop, sock_closed, flush_queue(State, {error, sock_closed})};
+handle_info(timeout, State) ->
+    %% This process has timed out on the socket after sending
+    %% a request to the PG server.
+    {stop, timeout, flush_queue(State, {error, timeout})};
 
 handle_info({Error, Sock, Reason}, #state{sock = Sock} = State)
   when Error == tcp_error; Error == ssl_error ->
     Why = {sock_error, Reason},
     {stop, Why, flush_queue(State, {error, Why})};
 
-handle_info({inet_reply, _, ok}, State) ->
-    {noreply, State};
+handle_info({inet_reply, _, ok}, #state{timeout = Timeout} = State) ->
+    %  Start the timeout counter here - we've successfully sent a message,
+    %  and we should expect a reply aftr this point.
+    %  TODO: if module is ssl, do we still use port_command?
+    %  TODO: confirm  wire protocol: every message gets a response
+    %        (should be safe, the internal queueing seems to rely on it)
+    {noreply, State, Timeout};
 
 handle_info({inet_reply, _, Status}, State) ->
     {stop, Status, flush_queue(State, {error, Status})};
 
-handle_info({_, Sock, Data2}, #state{data = Data, sock = Sock} = State) ->
+handle_info({_M, Sock, Data2}, #state{data = Data, sock = Sock} = State) ->
     loop(State#state{data = <<Data/binary, Data2/binary>>}).
 
 terminate(_Reason, _State) ->
@@ -168,7 +178,9 @@ command(Command, State = #state{sync_required = true})
 command({connect, Host, Username, Password, Opts}, State) ->
     Timeout = proplists:get_value(timeout, Opts, 5000),
     Port = proplists:get_value(port, Opts, 5432),
-    SockOpts = [{active, false}, {packet, raw}, binary, {nodelay, true}, {keepalive, true}],
+    SockOpts = [{active, false}, {packet, raw}, binary, {nodelay, true},
+                {send_timeout, Timeout},
+                {send_timeout_close, true}],
     case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
         {ok, Sock} ->
 
@@ -185,7 +197,7 @@ command({connect, Host, Username, Password, Opts}, State) ->
                          T when T == true; T == required ->
                              start_ssl(Sock, T, Opts, State);
                          _ ->
-                             State#state{mod  = gen_tcp, sock = Sock}
+                             State#state{mod  = gen_tcp, sock = Sock, timeout = Timeout}
                      end,
 
             Opts2 = ["user", 0, Username, 0],
@@ -206,14 +218,18 @@ command({connect, Host, Username, Password, Opts}, State) ->
             {stop, Reason, finish(State, Error)}
     end;
 
-command({squery, Sql}, State) ->
+command({squery, Sql}, #state{timeout = Timeout} = State) ->
     send(State, ?SIMPLEQUERY, [Sql, 0]),
-    {noreply, State};
+    % TODO - verify that these (and below) are still needed
+    %        From what I've seen so far, inet_reply will be enough.
+    %        Only open question if its behavior when we're using an ssl conn
+    %
+    {noreply, State, Timeout};
 
 %% TODO add fast_equery command that doesn't need parsed statement,
 %% uses default (text) column format,
 %% sends Describe after Bind to get RowDescription
-command({equery, Statement, Parameters}, #state{codec = Codec} = State) ->
+command({equery, Statement, Parameters}, #state{codec = Codec, timeout = Timeout} = State) ->
     #statement{name = StatementName, columns = Columns} = Statement,
     Bin1 = epgsql_wire:encode_parameters(Parameters, Codec),
     Bin2 = epgsql_wire:encode_formats(Columns),
@@ -221,31 +237,31 @@ command({equery, Statement, Parameters}, #state{codec = Codec} = State) ->
     send(State, ?EXECUTE, ["", 0, <<0:?int32>>]),
     send(State, ?CLOSE, [?PREPARED_STATEMENT, StatementName, 0]),
     send(State, ?SYNC, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({parse, Name, Sql, Types}, State) ->
+command({parse, Name, Sql, Types}, #state{timeout = Timeout} = State) ->
     Bin = epgsql_wire:encode_types(Types, State#state.codec),
     send(State, ?PARSE, [Name, 0, Sql, 0, Bin]),
     send(State, ?DESCRIBE, [?PREPARED_STATEMENT, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({bind, Statement, PortalName, Parameters}, #state{codec = Codec} = State) ->
+command({bind, Statement, PortalName, Parameters}, #state{codec = Codec, timeout = Timeout} = State) ->
     #statement{name = StatementName, columns = Columns, types = Types} = Statement,
     Typed_Parameters = lists:zip(Types, Parameters),
     Bin1 = epgsql_wire:encode_parameters(Typed_Parameters, Codec),
     Bin2 = epgsql_wire:encode_formats(Columns),
     send(State, ?BIND, [PortalName, 0, StatementName, 0, Bin1, Bin2]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({execute, _Statement, PortalName, MaxRows}, State) ->
+command({execute, _Statement, PortalName, MaxRows}, #state{timeout = Timeout} = State) ->
     send(State, ?EXECUTE, [PortalName, 0, <<MaxRows:?int32>>]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
 command({execute_batch, Batch}, State) ->
-    #state{mod = Mod, sock = Sock, codec = Codec} = State,
+    #state{mod = Mod, sock = Sock, codec = Codec, timeout = Timeout} = State,
     BindExecute =
         lists:map(
           fun({Statement, Parameters}) ->
@@ -262,30 +278,30 @@ command({execute_batch, Batch}, State) ->
           Batch),
     Sync = epgsql_wire:encode(?SYNC, []),
     do_send(Mod, Sock, [BindExecute, Sync]),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({describe_statement, Name}, State) ->
+command({describe_statement, Name}, #state{timeout = Timeout} = State) ->
     send(State, ?DESCRIBE, [?PREPARED_STATEMENT, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({describe_portal, Name}, State) ->
+command({describe_portal, Name}, #state{timeout = Timeout} = State) ->
     send(State, ?DESCRIBE, [?PORTAL, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({close, Type, Name}, State) ->
+command({close, Type, Name}, #state{timeout = Timeout} = State) ->
     Type2 = case Type of
         statement -> ?PREPARED_STATEMENT;
         portal    -> ?PORTAL
     end,
     send(State, ?CLOSE, [Type2, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command(sync, State) ->
+command(sync, #state{timeout = Timeout} = State) ->
     send(State, ?SYNC, []),
-    {noreply, State#state{sync_required = false}}.
+    {noreply, State#state{sync_required = false}, Timeout}.
 
 start_ssl(S, Flag, Opts, State) ->
     ok = gen_tcp:send(S, <<8:?int32, 80877103:?int32>>),
@@ -328,7 +344,11 @@ do_send(gen_tcp, Sock, Bin) ->
 do_send(Mod, Sock, Bin) ->
     Mod:send(Sock, Bin).
 
-loop(#state{data = Data, handler = Handler} = State) ->
+%% TODO: given the nature of how we accrue incoming data,
+%%       what we're missing is any way to enforce a timeout
+%%       when data is arriving in multiple packets.
+%%       TODO: wanted - some indication of WHEN we're waiting for data.
+loop(#state{queue = Q, timeout = Timeout, data = Data, handler = Handler} = State) ->
     case epgsql_wire:decode_message(Data) of
         {Message, Tail} ->
             case ?MODULE:Handler(Message, State#state{data = Tail}) of
@@ -337,8 +357,16 @@ loop(#state{data = Data, handler = Handler} = State) ->
                 R = {stop, _Reason2, _State2} ->
                     R
             end;
-        _ ->
-            {noreply, State}
+        _M ->
+            % If we have more commands to process, that means we're expecting additional data
+            % Use a timeout to ensure we get it or fail.
+            T = case queue:is_empty(Q) of
+                    true ->
+                        infinity;
+                    false ->
+                        Timeout
+                end,
+            {noreply, State, T}
     end.
 
 finish(State, Result) ->
