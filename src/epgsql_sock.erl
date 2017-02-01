@@ -18,7 +18,6 @@
 
 -include("epgsql.hrl").
 -include("epgsql_binary.hrl").
-
 %% Commands defined as per this page:
 %% http://www.postgresql.org/docs/9.2/static/protocol-message-formats.html
 
@@ -72,7 +71,8 @@
                 results = [],
                 batch = [],
                 sync_required,
-                txstatus}).
+                txstatus,
+                timeout = infinity}).
 
 %% -- client interface --
 
@@ -96,14 +96,13 @@ init([]) ->
 
 handle_call({update_type_cache, TypeInfos}, _From, #state{codec = Codec} = State) ->
     Codec2 = epgsql_binary:update_type_cache(TypeInfos, Codec),
-    {reply, ok, State#state{codec = Codec2}};
-
+    {reply, ok, State#state{codec = Codec2}, timeout(State)};
 handle_call({get_parameter, Name}, _From, State) ->
     Value1 = case lists:keysearch(Name, 1, State#state.parameters) of
         {value, {Name, Value}} -> Value;
         false                  -> undefined
     end,
-    {reply, {ok, Value1}, State};
+    {reply, {ok, Value1}, State, timeout(State)};
 
 handle_call(Command, From, State) ->
     #state{queue = Q} = State,
@@ -132,24 +131,41 @@ handle_cast(cancel, State = #state{backend = {Pid, Key},
     Msg = <<16:?int32, 80877102:?int32, Pid:?int32, Key:?int32>>,
     ok = gen_tcp:send(Sock, Msg),
     gen_tcp:close(Sock),
-    {noreply, State}.
+    {noreply, State, timeout(State)}.
 
 handle_info({Closed, Sock}, #state{sock = Sock} = State)
   when Closed == tcp_closed; Closed == ssl_closed ->
     {stop, sock_closed, flush_queue(State, {error, sock_closed})};
+
+handle_info(timeout, #state{txstatus = undefined} = State) ->
+    %% Timeout occurred before we received ReadyForQuery
+    {stop, timeout, flush_queue(State, {error, timeout})};
+handle_info(timeout, #state{queue = Q} = State) ->
+    %% We expected further messages from the pg server and received none
+    %% within the timeout (default: infinity).  Verify that we were
+    %% expecting a response, and terminate if so.
+    case queue:is_empty(Q) of
+        true ->
+            % False alarm, we had no pending replies
+            {noreply, state, infinity};
+        false ->
+            {stop, {error, timeout}, flush_queue(State, {error, timeout})}
+    end;
 
 handle_info({Error, Sock, Reason}, #state{sock = Sock} = State)
   when Error == tcp_error; Error == ssl_error ->
     Why = {sock_error, Reason},
     {stop, Why, flush_queue(State, {error, Why})};
 
-handle_info({inet_reply, _, ok}, State) ->
-    {noreply, State};
+handle_info({inet_reply, _, ok}, #state{timeout = Timeout} = State) ->
+    %  Start the timeout counter here - we've successfully sent a message,
+    %  and we should expect a reply aftr this point.
+   {noreply, State, Timeout};
 
 handle_info({inet_reply, _, Status}, State) ->
     {stop, Status, flush_queue(State, {error, Status})};
 
-handle_info({_, Sock, Data2}, #state{data = Data, sock = Sock} = State) ->
+handle_info({_M, Sock, Data2}, #state{data = Data, sock = Sock} = State) ->
     loop(State#state{data = <<Data/binary, Data2/binary>>}).
 
 terminate(_Reason, _State) ->
@@ -167,8 +183,11 @@ command(Command, State = #state{sync_required = true})
 
 command({connect, Host, Username, Password, Opts}, State) ->
     Timeout = proplists:get_value(timeout, Opts, 5000),
+    ReqTimeout = proplists:get_value(req_timeout, Opts, infinity),
     Port = proplists:get_value(port, Opts, 5432),
-    SockOpts = [{active, false}, {packet, raw}, binary, {nodelay, true}, {keepalive, true}],
+    SockOpts = [{active, false}, {packet, raw}, binary, {nodelay, true},
+                {send_timeout, Timeout},
+                {send_timeout_close, true}],
     case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
         {ok, Sock} ->
 
@@ -180,12 +199,12 @@ command({connect, Host, Username, Password, Opts}, State) ->
             {ok, [{recbuf, RecBufSize}, {sndbuf, SndBufSize}]} =
                 inet:getopts(Sock, [recbuf, sndbuf]),
             inet:setopts(Sock, [{buffer, max(RecBufSize, SndBufSize)}]),
-
+            State1 = State#state{timeout = ReqTimeout},
             State2 = case proplists:get_value(ssl, Opts) of
                          T when T == true; T == required ->
-                             start_ssl(Sock, T, Opts, State);
+                             start_ssl(Sock, T, Opts, State1);
                          _ ->
-                             State#state{mod  = gen_tcp, sock = Sock}
+                             State1#state{mod  = gen_tcp, sock = Sock}
                      end,
 
             Opts2 = ["user", 0, Username, 0],
@@ -206,14 +225,14 @@ command({connect, Host, Username, Password, Opts}, State) ->
             {stop, Reason, finish(State, Error)}
     end;
 
-command({squery, Sql}, State) ->
+command({squery, Sql}, #state{timeout = Timeout} = State) ->
     send(State, ?SIMPLEQUERY, [Sql, 0]),
-    {noreply, State};
+    {noreply, State, Timeout};
 
 %% TODO add fast_equery command that doesn't need parsed statement,
 %% uses default (text) column format,
 %% sends Describe after Bind to get RowDescription
-command({equery, Statement, Parameters}, #state{codec = Codec} = State) ->
+command({equery, Statement, Parameters}, #state{codec = Codec, timeout = Timeout} = State) ->
     #statement{name = StatementName, columns = Columns} = Statement,
     Bin1 = epgsql_wire:encode_parameters(Parameters, Codec),
     Bin2 = epgsql_wire:encode_formats(Columns),
@@ -221,31 +240,31 @@ command({equery, Statement, Parameters}, #state{codec = Codec} = State) ->
     send(State, ?EXECUTE, ["", 0, <<0:?int32>>]),
     send(State, ?CLOSE, [?PREPARED_STATEMENT, StatementName, 0]),
     send(State, ?SYNC, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({parse, Name, Sql, Types}, State) ->
+command({parse, Name, Sql, Types}, #state{timeout = Timeout} = State) ->
     Bin = epgsql_wire:encode_types(Types, State#state.codec),
     send(State, ?PARSE, [Name, 0, Sql, 0, Bin]),
     send(State, ?DESCRIBE, [?PREPARED_STATEMENT, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({bind, Statement, PortalName, Parameters}, #state{codec = Codec} = State) ->
+command({bind, Statement, PortalName, Parameters}, #state{codec = Codec, timeout = Timeout} = State) ->
     #statement{name = StatementName, columns = Columns, types = Types} = Statement,
     Typed_Parameters = lists:zip(Types, Parameters),
     Bin1 = epgsql_wire:encode_parameters(Typed_Parameters, Codec),
     Bin2 = epgsql_wire:encode_formats(Columns),
     send(State, ?BIND, [PortalName, 0, StatementName, 0, Bin1, Bin2]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({execute, _Statement, PortalName, MaxRows}, State) ->
+command({execute, _Statement, PortalName, MaxRows}, #state{timeout = Timeout} = State) ->
     send(State, ?EXECUTE, [PortalName, 0, <<MaxRows:?int32>>]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
 command({execute_batch, Batch}, State) ->
-    #state{mod = Mod, sock = Sock, codec = Codec} = State,
+    #state{mod = Mod, sock = Sock, codec = Codec, timeout = Timeout} = State,
     BindExecute =
         lists:map(
           fun({Statement, Parameters}) ->
@@ -262,30 +281,33 @@ command({execute_batch, Batch}, State) ->
           Batch),
     Sync = epgsql_wire:encode(?SYNC, []),
     do_send(Mod, Sock, [BindExecute, Sync]),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({describe_statement, Name}, State) ->
+command({describe_statement, Name}, #state{timeout = Timeout} = State) ->
     send(State, ?DESCRIBE, [?PREPARED_STATEMENT, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({describe_portal, Name}, State) ->
+command({describe_portal, Name}, #state{timeout = Timeout} = State) ->
     send(State, ?DESCRIBE, [?PORTAL, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command({close, Type, Name}, State) ->
+command({close, Type, Name}, #state{timeout = Timeout} = State) ->
     Type2 = case Type of
         statement -> ?PREPARED_STATEMENT;
         portal    -> ?PORTAL
     end,
     send(State, ?CLOSE, [Type2, Name, 0]),
     send(State, ?FLUSH, []),
-    {noreply, State};
+    {noreply, State, Timeout};
 
-command(sync, State) ->
+command(sync, #state{timeout = Timeout} = State) ->
     send(State, ?SYNC, []),
-    {noreply, State#state{sync_required = false}}.
+    % sync will cause a ReadyForQuery to be issued - always
+    % set the timeout here to ensure we receive that message
+    % in the specified timeframe.
+    {noreply, State#state{sync_required = false}, Timeout}.
 
 start_ssl(S, Flag, Opts, State) ->
     ok = gen_tcp:send(S, <<8:?int32, 80877103:?int32>>),
@@ -332,13 +354,15 @@ loop(#state{data = Data, handler = Handler} = State) ->
     case epgsql_wire:decode_message(Data) of
         {Message, Tail} ->
             case ?MODULE:Handler(Message, State#state{data = Tail}) of
-                {noreply, State2} ->
+                {noreply, State2, _Timeout} ->
+                    loop(State2);
+                {noreply, State2}  ->
                     loop(State2);
                 R = {stop, _Reason2, _State2} ->
                     R
             end;
-        _ ->
-            {noreply, State}
+        _M ->
+            {noreply, State, timeout(State)}
     end.
 
 finish(State, Result) ->
@@ -464,23 +488,37 @@ hex(Bin) ->
             end,
     <<<<(HChar(H)), (HChar(L))>> || <<H:4, L:4>> <= Bin>>.
 
+timeout(#state{timeout = infinity}) ->
+    infinity;
+timeout(#state{timeout = Timeout, queue = Q}) ->
+    case queue:is_empty(Q) of
+        true -> infinity;
+        false -> Timeout
+    end.
+
 %% -- backend message handling --
 
 %% AuthenticationOk
-auth({?AUTHENTICATION_REQUEST, <<0:?int32>>}, State) ->
-    {noreply, State#state{handler = initializing}};
+auth({?AUTHENTICATION_REQUEST, <<0:?int32>>}, #state{timeout = Timeout} = State) ->
+    % Continue to set the timeout until ReadyForQuery when we expect
+    % no further startup messages. This will allow us to
+    % recognize if our connection gets broken without telling us during
+    % the startup sequence.
+    {noreply, State#state{handler = initializing}, Timeout};
 
 %% AuthenticationCleartextPassword
-auth({?AUTHENTICATION_REQUEST, <<3:?int32>>}, State) ->
+auth({?AUTHENTICATION_REQUEST, <<3:?int32>>},
+     #state{timeout = Timeout} = State) ->
     send(State, ?PASSWORD, [get(password), 0]),
-    {noreply, State};
+    {noreply, State, Timeout};
 
 %% AuthenticationMD5Password
-auth({?AUTHENTICATION_REQUEST, <<5:?int32, Salt:4/binary>>}, State) ->
+auth({?AUTHENTICATION_REQUEST, <<5:?int32, Salt:4/binary>>},
+     #state{timeout = Timeout} = State) ->
     Digest1 = hex(erlang:md5([get(password), get(username)])),
     Str = ["md5", hex(erlang:md5([Digest1, Salt])), 0],
     send(State, ?PASSWORD, Str),
-    {noreply, State};
+    {noreply, State, Timeout};
 
 auth({?AUTHENTICATION_REQUEST, <<M:?int32, _/binary>>}, State) ->
     Method = case M of
@@ -507,8 +545,11 @@ auth(Other, State) ->
     on_message(Other, State).
 
 %% BackendKeyData
-initializing({?CANCELLATION_KEY, <<Pid:?int32, Key:?int32>>}, State) ->
-    {noreply, State#state{backend = {Pid, Key}}};
+initializing({?CANCELLATION_KEY, <<Pid:?int32, Key:?int32>>},
+             #state{timeout = Timeout} = State) ->
+    % Part of the startup sequence - we're still expecting
+    % ReadyForQuery, so we'll specify a timeout
+    {noreply, State#state{backend = {Pid, Key}}, Timeout};
 
 %% ReadyForQuery
 initializing({?READY_FOR_QUERY, <<Status:8>>}, State) ->
@@ -524,7 +565,7 @@ initializing({?READY_FOR_QUERY, <<Status:8>>}, State) ->
                                txstatus = Status,
                                codec = epgsql_binary:new_codec([])},
                    connected),
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 initializing({error, _} = Error, State) ->
     {stop, normal, finish(State, Error)};
@@ -534,13 +575,13 @@ initializing(Other, State) ->
 
 %% ParseComplete
 on_message({?PARSE_COMPLETE, <<>>}, State) ->
-    {noreply, State};
+    {noreply, State, timeout(State)};
 
 %% ParameterDescription
 on_message({?PARAMETER_DESCRIPTION, <<_Count:?int16, Bin/binary>>}, State) ->
     Types = [epgsql_binary:oid2type(Oid, State#state.codec) || <<Oid:?int32>> <= Bin],
     State2 = notify(State#state{types = Types}, {types, Types}),
-    {noreply, State2};
+    {noreply, State2, timeout(State)};
 
 %% RowDescription
 on_message({?ROW_DESCRIPTION, <<Count:?int16, Bin/binary>>}, State) ->
@@ -563,7 +604,7 @@ on_message({?ROW_DESCRIPTION, <<Count:?int16, Bin/binary>>}, State) ->
                  describe_portal ->
                      finish(State2, Message, {ok, Columns})
              end,
-    {noreply, State3};
+    {noreply, State3, timeout(State3)};
 
 %% NoData
 on_message({?NO_DATA, <<>>}, State) ->
@@ -573,7 +614,7 @@ on_message({?NO_DATA, <<>>}, State) ->
                  describe_portal ->
                      finish(State, no_data, {ok, []})
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% BindComplete
 on_message({?BIND_COMPLETE, <<>>}, State) ->
@@ -593,7 +634,7 @@ on_message({?BIND_COMPLETE, <<>>}, State) ->
                          end,
                      State#state{batch = Batch}
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% CloseComplete
 on_message({?CLOSE_COMPLETE, <<>>}, State) ->
@@ -603,19 +644,19 @@ on_message({?CLOSE_COMPLETE, <<>>}, State) ->
                  close ->
                      finish(State, ok)
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% DataRow
 on_message({?DATA_ROW, <<_Count:?int16, Bin/binary>>}, State) ->
     Data = epgsql_wire:decode_data(get_columns(State), Bin, State#state.codec),
-    {noreply, add_row(State, Data)};
+    {noreply, add_row(State, Data), timeout(State)};
 
 %% PortalSuspended
 on_message({?PORTAL_SUSPENDED, <<>>}, State) ->
     State2 = finish(State,
                    suspended,
                    {partial, lists:reverse(State#state.rows)}),
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% CommandComplete
 on_message({?COMMAND_COMPLETE, Bin}, State) ->
@@ -643,7 +684,7 @@ on_message({?COMMAND_COMPLETE, Bin}, State) ->
                  {C, _, _} when C == squery; C == equery ->
                      add_result(State, Notice, {ok, get_columns(State), Rows})
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% EmptyQueryResponse
 on_message({?EMPTY_QUERY, _Bin}, State) ->
@@ -654,7 +695,7 @@ on_message({?EMPTY_QUERY, _Bin}, State) ->
                  C when C == squery; C == equery ->
                      add_result(State, Notice, {ok, [], []})
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% ReadyForQuery
 on_message({?READY_FOR_QUERY, <<Status:8>>}, State) ->
@@ -678,7 +719,7 @@ on_message({?READY_FOR_QUERY, <<Status:8>>}, State) ->
                  sync ->
                      finish(State, ok)
              end,
-    {noreply, State2#state{txstatus = Status}};
+    {noreply, State2#state{txstatus = Status}, timeout(State2)};
 
 on_message(Error = {error, _}, State) ->
     State2 = case command_tag(State) of
@@ -687,19 +728,19 @@ on_message(Error = {error, _}, State) ->
                  _ ->
                      sync_required(finish(State, Error))
              end,
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% NoticeResponse
 on_message({?NOTICE, Data}, State) ->
     State2 = notify_async(State, {notice, epgsql_wire:decode_error(Data)}),
-    {noreply, State2};
+    {noreply, State2, timeout(State2)};
 
 %% ParameterStatus
 on_message({?PARAMETER_STATUS, Data}, State) ->
     [Name, Value] = epgsql_wire:decode_strings(Data),
     Parameters2 = lists:keystore(Name, 1, State#state.parameters,
                                  {Name, Value}),
-    {noreply, State#state{parameters = Parameters2}};
+    {noreply, State#state{parameters = Parameters2}, timeout(State)};
 
 %% NotificationResponse
 on_message({?NOTIFICATION, <<Pid:?int32, Strings/binary>>}, State) ->
@@ -708,4 +749,5 @@ on_message({?NOTIFICATION, <<Pid:?int32, Strings/binary>>}, State) ->
         [Channel]          -> {Channel, <<>>}
     end,
     State2 = notify_async(State, {notification, Channel1, Pid, Payload1}),
-    {noreply, State2}.
+    {noreply, State2, timeout(State2)}.
+
