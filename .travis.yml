@@ -1,5 +1,8 @@
 sudo: false
 language: erlang
+branches:
+  only:
+    - master
 otp_release:
   - R16B03-1
   - 17.4
@@ -11,8 +14,8 @@ addons:
   postgresql: "9.4"
 script:
   - ./setup_test_db.sh
-  - ./start_test_db.sh &
+  - pg_ctl start -D datadir/ -o "-p 10432 -k `pwd`/datadir/"
   - sleep 1
   - make create_testdbs
   - make test
-
+  - pg_ctl stop -D datadir/
