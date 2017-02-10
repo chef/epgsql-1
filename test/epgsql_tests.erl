@@ -112,6 +112,29 @@ select_test(Module) ->
               [{<<"1">>, <<"one">>}, {<<"2">>, <<"two">>}] = Rows
       end).
 
+select_request_timeout_test(epgsql) ->
+    P = self(),
+    RunFun = fun() ->
+                process_flag(trap_exit, true),
+                with_connection(
+                  epgsql,
+                  fun(C) ->
+                          Result = epgsql:squery(C, "select pg_sleep(200)"),
+                          P ! {result, Result}
+                  end,
+                  "epgsql_test",
+                  [{req_timeout, 150}])
+             end,
+    spawn(RunFun),
+    {result, {error, timeout}} = receive R -> R end,
+    %{'EXIT', _, {error, timeout}} = receive R -> R end,
+    %{'EXIT', _, _} = receive R1 -> R1 end,
+    flush();
+select_request_timeout_test(_) ->
+    %% request-level timeouts are not yet supported in
+    %% other interfaces
+    ok.
+
 insert_test(Module) ->
     with_rollback(
       Module,
@@ -544,10 +567,10 @@ date_time_type_test(Module) ->
     with_connection(
       Module,
       fun(C) ->
-              case Module:get_parameter(C, "integer_datetimes") of
-                  {ok, <<"on">>}  -> MaxTsDate = 294276;
-                  {ok, <<"off">>} -> MaxTsDate = 5874897
-              end,
+              MaxTsDate = case Module:get_parameter(C, "integer_datetimes") of
+                              {ok, <<"on">>}  -> 294276;
+                              {ok, <<"off">>} -> 5874897
+                          end,
 
               check_type(Module, date, "'2008-01-02'", {2008,1,2}, [{-4712,1,1}, {5874897,1,1}]),
               check_type(Module, time, "'00:01:02'", {0,1,2.0}, [{0,0,0.0}, {24,0,0.0}]),
@@ -823,17 +846,18 @@ all_test_() ->
         end,
     [WithModule(epgsql),
      WithModule(epgsql_cast),
-     WithModule(epgsql_incremental)].
+     WithModule(epgsql_incremental)
+     ].
 
 %% -- internal functions --
 
 connect_only(Module, Args) ->
     TestOpts = [{port, ?port}],
-    case Args of
-        [User, Opts]       -> Args2 = [User, TestOpts ++ Opts];
-        [User, Pass, Opts] -> Args2 = [User, Pass, TestOpts ++ Opts];
-        Opts               -> Args2 = [TestOpts ++ Opts]
-    end,
+    Args2 = case Args of
+                [User, Opts]       -> [User, TestOpts ++ Opts];
+                [User, Pass, Opts] -> [User, Pass, TestOpts ++ Opts];
+                Opts               -> [TestOpts ++ Opts]
+            end,
     {ok, C} = apply(Module, connect, [?host | Args2]),
     Module:close(C),
     flush().

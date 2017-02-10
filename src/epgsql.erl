@@ -31,11 +31,12 @@
 -type host() :: inet:ip_address() | inet:hostname().
 -type connection() :: pid().
 -type connect_option() ::
-    {database, DBName     :: string()}             |
-    {port,     PortNum    :: inet:port_number()}   |
-    {ssl,      IsEnabled  :: boolean() | required} |
-    {ssl_opts, SslOptions :: [ssl:ssl_option()]}   | % @see OTP ssl app, ssl_api.hrl
-    {timeout,  TimeoutMs  :: timeout()}            | % default: 5000 ms
+    {database,    DBName     :: string()}             |
+    {port,        PortNum    :: inet:port_number()}   |
+    {ssl,         IsEnabled  :: boolean() | required} |
+    {ssl_opts,    SslOptions :: [ssl:ssl_option()]}   | % @see OTP ssl app, ssl_api.hrl
+    {timeout,     TimeoutMs  :: timeout()}            | % default: 5000 ms
+    {req_timeout, ReqTimeout :: timeout()}            | % default: infinity
     {async,    Receiver   :: pid()}. % process to receive LISTEN/NOTIFY msgs
 -type connect_error() :: #error{}.
 -type query_error() :: #error{}.

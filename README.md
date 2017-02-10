@@ -46,12 +46,13 @@ see `CHANGES` for full list.
 -type host() :: inet:ip_address() | inet:hostname().
 
 -type connect_option() ::
-    {database, DBName     :: string()}             |
-    {port,     PortNum    :: inet:port_number()}   |
-    {ssl,      IsEnabled  :: boolean() | required} |
-    {ssl_opts, SslOptions :: [ssl:ssl_option()]}   | % @see OTP ssl app, ssl_api.hrl
-    {timeout,  TimeoutMs  :: timeout()}            | % default: 5000 ms
-    {async,    Receiver   :: pid()}. % process to receive LISTEN/NOTIFY msgs
+    {database,    DBName     :: string()}             |
+    {port,        PortNum    :: inet:port_number()}   |
+    {ssl,         IsEnabled  :: boolean() | required} |
+    {ssl_opts,    SslOptions :: [ssl:ssl_option()]}   | % @see OTP ssl app, ssl_api.hrl
+    {timeout,     TimeoutMs  :: timeout()}            | % default: 5000 ms, initial connection timeout.
+    {req_timeout, ReqTimeout :: timeout()}            | % default: infinity, how long to wait for a response to any given request.
+    {async,       Receiver   :: pid()}. % process to receive LISTEN/NOTIFY msgs
 
 -spec connect(host(), string(), string(), [connect_option()])
         -> {ok, Connection :: connection()} | {error, Reason :: connect_error()}.
