@@ -13,11 +13,13 @@ otp_release:
 before_script:
   - psql -U postgres -c "create extension postgis"
 addons:
-  postgresql: "9.4"
+  postgresql: "9.6"
   apt:
     packages:
       - postgresql-9.6-postgis-2.3
       - postgresql-contrib-9.6
+env:
+  - PATH=".:/usr/lib/postgresql/9.6/bin:$PATH"
 script:
   - ./setup_test_db.sh
   - pg_ctl start -D datadir/ -o "-p 10432 -k `pwd`/datadir/"
