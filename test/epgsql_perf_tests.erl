@@ -38,7 +38,7 @@ drop_data() ->
     end)}.
 
 noise(N) ->
-    crypto:rand_bytes(N).
+    crypto:strong_rand_bytes(N).
 
 %%
 
