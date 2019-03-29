@@ -8,16 +8,20 @@ otp_release:
   - 17.4
   - 18.3
   - 19.1
-  - 19.1
+  - 20.3
   - 21.0
 before_script:
   - psql -U postgres -c "create extension postgis"
 addons:
   postgresql: "9.4"
+  apt:
+    packages:
+      - postgresql-9.6-postgis-2.3
+      - postgresql-contrib-9.6
 script:
   - ./setup_test_db.sh
   - pg_ctl start -D datadir/ -o "-p 10432 -k `pwd`/datadir/"
   - sleep 1
   - make create_testdbs
   - make test
-  - pg_ctl stop -D datadir/ || true 
+  - pg_ctl stop -D datadir/ || true
