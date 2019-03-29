@@ -100,7 +100,7 @@ connect_with_client_cert_test(Module) ->
               {ok, _, [{Serial2}]} = Module:equery(C, "select ssl_client_serial()")
       end,
       "epgsql_test_cert",
-      [{ssl, true}, {keyfile, File("epgsql.key")}, {certfile, File("epgsql.crt")}]).
+      [{ssl, true}, {ssl_opts, [{keyfile, File("epgsql.key")}, {certfile, File("epgsql.crt")}]}]).
 
 select_test(Module) ->
     with_connection(
