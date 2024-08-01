@@ -340,14 +340,12 @@ send(#state{mod = Mod, sock = Sock}, Type, Data) ->
     do_send(Mod, Sock, epgsql_wire:encode(Type, Data)).
 
 do_send(gen_tcp, Sock, Bin) ->
-    try erlang:port_command(Sock, Bin) of
-        true ->
-            ok
-    catch
-        error:_Error ->
-            {error,einval}
+    case gen_tcp:send(Sock, Bin) of
+        ok ->
+            ok;
+        {error, _Reason} ->
+            {error, einval}
     end;
-
 do_send(Mod, Sock, Bin) ->
     Mod:send(Sock, Bin).
 
