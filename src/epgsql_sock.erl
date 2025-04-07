@@ -109,6 +109,7 @@
                 txstatus :: byte() | undefined,  % $I | $T | $E,
                 complete_status :: atom() | {atom(), integer()} | undefined,
                 subproto_state :: repl_state() | copy_state() | undefined,
+                req_timeout = infinity :: timeout(),
                 connect_opts :: epgsql:connect_opts_map() | undefined}).
 
 -opaque pg_sock() :: #state{}.
@@ -130,7 +131,11 @@ close(C) when is_pid(C) ->
 
 -spec sync_command(epgsql:connection(), epgsql_command:command(), any()) -> any().
 sync_command(C, Command, Args) ->
-    gen_server:call(C, {command, Command, Args}, infinity).
+    Timeout = case gen_server:call(C, {get_req_timeout}, infinity) of
+                  {ok, infinity} -> infinity;
+                  {ok, ReqTimeout} -> ReqTimeout
+              end,
+    gen_server:call(C, {command, Command, Args}, Timeout).
 
 -spec async_command(epgsql:connection(), cast | incremental,
                     epgsql_command:command(), any()) -> reference().
@@ -231,6 +236,11 @@ get_parameter_internal(Name, #state{parameters = Parameters}) ->
 
 init([]) ->
     {ok, #state{}}.
+
+
+
+handle_call({get_req_timeout}, _From, State) ->
+    {reply, {ok, State#state.req_timeout}, State};
 
 handle_call({command, Command, Args}, From, State) ->
     Transport = {call, From},
@@ -372,7 +382,15 @@ handle_socket_pasive(State) ->
               | {stop, Reason :: any(), pg_sock()}.
 command_new(Transport, Command, Args, State) ->
     CmdState = epgsql_command:init(Command, Args),
-    command_exec(Transport, Command, CmdState, State).
+    case Transport of
+        {call, From} ->
+            % For gen_server:call commands, we want to make the call asynchronous
+            % since the timeout is handled at the caller level in sync_command
+            gen_server:reply(From, {active, self()}),
+            command_exec(Transport, Command, CmdState, State);
+        _ ->
+            command_exec(Transport, Command, CmdState, State)
+    end.
 
 -spec command_exec(transport(), epgsql_command:command(), any(), pg_sock()) ->
                           Result when

@@ -75,6 +75,7 @@
     {ssl_opts, SslOptions :: ssl_options()}        | % see OTP ssl app documentation
     {tcp_opts, TcpOptions :: [gen_tcp:option()]}   | % see OTP gen_tcp module documentation
     {timeout,  TimeoutMs  :: timeout()}            | % connect timeout, default: 5000 ms
+    {req_timeout, ReqTimeout :: timeout()}         | % default: infinity, how long to wait for a response to any given request
     {async,    Receiver   :: pid() | atom()}       | % process to receive LISTEN/NOTIFY msgs
     {codecs,   Codecs     :: [{epgsql_codec:codec_mod(), any()}]} |
     {nulls,    Nulls      :: [any(), ...]} |    % terms to be used as NULL
