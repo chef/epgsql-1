@@ -1,4 +1,4 @@
--module(pg17_test).
+-module(pg16_test).
 -export([connect/0, test_query/0]).
 
 connect() ->
@@ -6,8 +6,8 @@ connect() ->
         host => "localhost",
         username => "sqerl",
         password => "sqerl",
-        database => "postgres",  % Using the default postgres database which always exists
-        port => 5433,  % Note: Using port 5433 as we mapped the container's 5432 to host's 5433
+        database => "sqerl_test",  % The database that was created by the POSTGRES_DB env var
+        port => 5432,  % PostgreSQL 16.1 is on the default port 5432
         timeout => 4000
     }),
     {ok, C}.

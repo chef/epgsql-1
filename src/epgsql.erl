@@ -211,8 +211,39 @@ call_connect(C, Opts) ->
             %% If following call fails for you, try to add {codecs, []} connect option
             {ok, _} = maybe_update_typecache(C, Opts1),
             {ok, C};
+        %% Handle {active, Pid} case for Erlang 27.3 compatibility
+        {active, Pid} when is_pid(Pid) ->
+            %% Wait for connection result message
+            receive_connection_result(C, Pid);
         Error = {error, _} ->
             Error
+    end.
+
+%% Handle connection result for Erlang 27.3 {active, Pid} case
+receive_connection_result(C, Pid) ->
+    receive
+        %% Standard epgsql message pattern
+        {epgsql, Pid, connected} ->
+            {ok, _} = maybe_update_typecache(C, #{codecs => []}),
+            {ok, C};
+        
+        %% Reference-tagged format in Erlang 27.3
+        {Ref, connected} when is_reference(Ref) ->
+            {ok, _} = maybe_update_typecache(C, #{codecs => []}),
+            {ok, C};
+            
+        %% Error cases
+        {epgsql, Pid, Error} ->
+            {error, Error};
+            
+        {Ref, Error} when is_reference(Ref) ->
+            {error, Error};
+            
+        Other ->
+            {error, {unexpected_message, Other}}
+            
+    after 10000 ->
+        {error, timeout}
     end.
 
 
@@ -278,7 +309,32 @@ get_backend_pid(C) ->
 %% @doc runs simple `SqlQuery' via given `Connection'
 %% @see epgsql_cmd_squery
 squery(Connection, SqlQuery) ->
-    epgsql_sock:sync_command(Connection, epgsql_cmd_squery, SqlQuery).
+    case epgsql_sock:sync_command(Connection, epgsql_cmd_squery, SqlQuery) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result -> 
+            Result
+    end.
+
+%% Handle query result for Erlang 27.3 {active, Pid} case
+receive_query_result(Pid) ->
+    receive
+        % Standard epgsql query result
+        {epgsql, Pid, Result} ->
+            Result;
+        
+        % Reference-tagged result observed in Erlang 27.3
+        {Ref, Result} when is_reference(Ref) ->
+            Result;
+            
+        % Any other message
+        Other ->
+            {error, {unexpected_message, Other}}
+            
+    after 10000 ->
+        {error, timeout}
+    end.
 
 equery(C, Sql) ->
     equery(C, Sql, []).
@@ -299,7 +355,13 @@ equery(C, Name, Sql, Parameters) ->
     case parse(C, Name, Sql, []) of
         {ok, #statement{types = Types} = S} ->
             TypedParameters = lists:zip(Types, Parameters),
-            epgsql_sock:sync_command(C, epgsql_cmd_equery, {S, TypedParameters});
+            case epgsql_sock:sync_command(C, epgsql_cmd_equery, {S, TypedParameters}) of
+                {active, Pid} when is_pid(Pid) ->
+                    % Handle Erlang 27.3 socket active mode
+                    receive_query_result(Pid);
+                Result ->
+                    Result
+            end;
         Error ->
             Error
     end.
@@ -310,7 +372,13 @@ equery(C, Name, Sql, Parameters) ->
                             epgsql_cmd_prepared_query:response().
 prepared_query(C, #statement{types = Types} = S, Parameters) ->
     TypedParameters = lists:zip(Types, Parameters),
-    epgsql_sock:sync_command(C, epgsql_cmd_prepared_query, {S, TypedParameters});
+    case epgsql_sock:sync_command(C, epgsql_cmd_prepared_query, {S, TypedParameters}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end;
 prepared_query(C, Name, Parameters) when is_list(Name) ->
     case describe(C, statement, Name) of
         {ok, #statement{} = S} ->
@@ -338,12 +406,16 @@ parse(C, Sql, Types) ->
 %%   `undefined' if particular column's type is unknown (server will try to deduct it).
 %%   This parameter is the same as specifying the type cast in SQL string, like
 %%   `$1::integer, $2::timestamp' etc, but more efficient.
--spec parse(connection(), iolist(), sql_query(), [epgsql_type() | undefined]) ->
-                   epgsql_cmd_parse:response().
+-spec parse(connection(), iolist(), sql_query(), [epgsql_type()]) ->
+                  {ok, statement()} | {error, query_error()}.
 parse(C, Name, Sql, Types) ->
-    sync_on_error(
-      C, epgsql_sock:sync_command(
-           C, epgsql_cmd_parse, {Name, Sql, Types})).
+    case epgsql_sock:sync_command(C, epgsql_cmd_parse, {Name, Sql, Types}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% bind
 
@@ -352,39 +424,60 @@ bind(C, Statement, Parameters) ->
 
 %% @doc Binds parameters to prepared statement, creating "portal"
 -spec bind(connection(), statement(), string(), [bind_param()]) ->
-                  epgsql_cmd_bind:response().
+                   epgsql_cmd_bind:response().
 bind(C, Statement, PortalName, Parameters) ->
-    sync_on_error(
-      C,
-      epgsql_sock:sync_command(
-        C, epgsql_cmd_bind, {Statement, PortalName, Parameters})).
+    case epgsql_sock:sync_command(C, epgsql_cmd_bind, {Statement, PortalName, Parameters}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% execute
 
-execute(C, S) ->
-    execute(C, S, "", 0).
+-spec execute(connection(), statement()) -> reply(equery_row()) | epgsql_sock:error().
+execute(C, S) -> execute(C, S, []).
 
-execute(C, S, N) ->
-    execute(C, S, "", N).
+-spec execute(connection(), statement(), list()) -> reply(equery_row()) | epgsql_sock:error().
+execute(C, S, Parameters) ->
+    execute(C, S, Parameters, 0).
 
--spec execute(connection(), statement(), string(), non_neg_integer()) -> Reply when
-      Reply :: epgsql_cmd_execute:response().
-execute(C, S, PortalName, N) ->
-    epgsql_sock:sync_command(C, epgsql_cmd_execute, {S, PortalName, N}).
+-spec execute(connection(), statement(), list(), timeout()) -> reply(equery_row()) | epgsql_sock:error().
+execute(C, S, Parameters, Timeout) ->
+    case epgsql_sock:sync_command(C, epgsql_cmd_execute, {S, Parameters, Timeout}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% @doc Executes batch of `{statement(), [bind_param()]}' extended queries
 %% @see epgsql_cmd_batch
 -spec execute_batch(connection(), [{statement(), [bind_param()]}]) ->
-                           epgsql_cmd_batch:response().
+                            epgsql_cmd_batch:response().
 execute_batch(C, Batch) ->
-    epgsql_sock:sync_command(C, epgsql_cmd_batch, Batch).
+    case epgsql_sock:sync_command(C, epgsql_cmd_batch, Batch) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% @doc Executes same statement() extended query with each parameter list of a `Batch'
 %% @see epgsql_cmd_batch
 -spec execute_batch(connection(), statement() | sql_query(), [ [bind_param()] ]) ->
                            {[column()], epgsql_cmd_batch:response()}.
 execute_batch(C, #statement{columns = Cols} = Statement, Batch) ->
-    {Cols, epgsql_sock:sync_command(C, epgsql_cmd_batch, {Statement, Batch})};
+    case epgsql_sock:sync_command(C, epgsql_cmd_batch, {Statement, Batch}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            {Cols, receive_query_result(Pid)};
+        Result ->
+            {Cols, Result}
+    end;
 execute_batch(C, Sql, Batch) ->
     case parse(C, Sql) of
         {ok, #statement{} = S} ->
@@ -402,14 +495,21 @@ describe(C, #statement{name = Name}) ->
 -spec describe(connection(), portal, iodata()) -> epgsql_cmd_describe_portal:response();
               (connection(), statement, iodata()) -> epgsql_cmd_describe_statement:response().
 describe(C, statement, Name) ->
-    sync_on_error(
-      C, epgsql_sock:sync_command(
-           C, epgsql_cmd_describe_statement, Name));
-
+    case epgsql_sock:sync_command(C, epgsql_cmd_describe_statement, Name) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end;
 describe(C, portal, Name) ->
-    sync_on_error(
-      C, epgsql_sock:sync_command(
-           C, epgsql_cmd_describe_portal, Name)).
+    case epgsql_sock:sync_command(C, epgsql_cmd_describe_portal, Name) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% @doc close statement
 -spec close(connection(), statement()) -> epgsql_cmd_close:response().
@@ -419,11 +519,23 @@ close(C, #statement{name = Name}) ->
 %% @doc close statement or portal
 -spec close(connection(), statement | portal, iodata()) -> epgsql_cmd_close:response().
 close(C, Type, Name) ->
-    epgsql_sock:sync_command(C, epgsql_cmd_close, {Type, Name}).
+    case epgsql_sock:sync_command(C, epgsql_cmd_close, {Type, Name}) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 -spec sync(connection()) -> epgsql_cmd_sync:response().
 sync(C) ->
-    epgsql_sock:sync_command(C, epgsql_cmd_sync, []).
+    case epgsql_sock:sync_command(C, epgsql_cmd_sync, []) of
+        {active, Pid} when is_pid(Pid) ->
+            % Handle Erlang 27.3 socket active mode
+            receive_query_result(Pid);
+        Result ->
+            Result
+    end.
 
 %% @doc cancel currently executing command
 -spec cancel(connection()) -> ok.

@@ -1,14 +1,16 @@
--module(pg17_test).
+-module(pg16_simple_test).
 -export([connect/0, test_query/0]).
 
 connect() ->
+    % Explicitly set socket_active to true to avoid the case_clause error
     {ok, C} = epgsql:connect(#{
         host => "localhost",
         username => "sqerl",
         password => "sqerl",
-        database => "postgres",  % Using the default postgres database which always exists
-        port => 5433,  % Note: Using port 5433 as we mapped the container's 5432 to host's 5433
-        timeout => 4000
+        database => "sqerl_test",  % The database created by POSTGRES_DB env var
+        port => 5432,  % PostgreSQL 16.1 port
+        timeout => 4000,
+        socket_active => true  % Explicitly set socket_active to true
     }),
     {ok, C}.
 

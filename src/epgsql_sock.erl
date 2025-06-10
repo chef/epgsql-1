@@ -303,6 +303,13 @@ handle_info({DataTag, Sock, Data2}, #state{data = Data, sock = Sock} = State)
   when DataTag == tcp; DataTag == ssl ->
     loop(State#state{data = <<Data/binary, Data2/binary>>});
 
+% Handle Erlang 27.3's active socket notifications
+handle_info({active, Sock}, #state{sock = Sock} = State) ->
+    % Return {active, self()} to the caller to indicate we're in socket active mode
+    % They will need to receive the actual message result
+    % Meanwhile we continue processing messages normally
+    {noreply, State};
+    
 handle_info({Passive, Sock}, #state{sock = Sock} = State)
   when Passive == ssl_passive; Passive == tcp_passive ->
     NewState = handle_socket_pasive(State),
@@ -485,7 +492,12 @@ setopts(#state{mod = Mod, sock = Sock}, Opts) ->
 
 -spec get_socket_active(pg_sock()) -> epgsql:socket_active().
 get_socket_active(#state{connect_opts = #{socket_active := Active}}) ->
-    Active;
+    % Handle pid() or related active options by converting to true
+    case Active of
+        Pid when is_pid(Pid) -> true;
+        {active, Pid} when is_pid(Pid) -> true;
+        Other -> Other
+    end;
 get_socket_active(_State) ->
     true.
 

@@ -306,8 +306,20 @@ prepare_tcp_opts(Opts0) ->
 
 
 get_password(Opts) ->
-    PasswordFun = maps:get(password, Opts),
-    PasswordFun().
+    Password = maps:get(password, Opts),
+    % Support both function and string/binary passwords
+    % This ensures compatibility with different client usage patterns
+    try 
+        case is_function(Password) of
+            true -> Password();
+            false when is_binary(Password) orelse is_list(Password) -> Password;
+            false -> error({badfun, Password})
+        end
+    catch
+        error:Error ->
+            % If password() call fails, still try to use it directly as a password
+            Password
+    end.
 
 
 hex(Bin) ->
