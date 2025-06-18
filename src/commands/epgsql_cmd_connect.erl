@@ -316,7 +316,7 @@ get_password(Opts) ->
             false -> error({badfun, Password})
         end
     catch
-        error:Error ->
+        error:_ ->
             % If password() call fails, still try to use it directly as a password
             Password
     end.
