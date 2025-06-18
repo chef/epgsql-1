@@ -38,7 +38,10 @@ encode(Str, bpchar, _) when is_list(Str) ->
         _ -> Str
     catch error:badarg ->
             unicode:characters_to_binary(Str)
-    end.
+    end;
+% Handle case where the atom 'global' is passed as the first argument
+encode(global, bpchar, _) ->
+    <<>>; % Return empty binary for global atom
 
 decode(<<C:1/big-unsigned-unit:8>>, _, _) -> C;
 decode(Bin, bpchar, _) -> Bin.
