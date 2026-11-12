@@ -126,7 +126,7 @@ start_link() ->
     gen_server:start_link(?MODULE, [], []).
 
 close(C) when is_pid(C) ->
-    catch gen_server:cast(C, stop),
+    try gen_server:cast(C, stop) catch _:_ -> ok end,
     ok.
 
 -spec sync_command(epgsql:connection(), epgsql_command:command(), any()) -> any().
